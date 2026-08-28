@@ -1,0 +1,9 @@
+{
+  "training_distances": [
+    3,
+    5,
+    7
+  ],
+  "p_val": 0.002,
+  "eta": 100.0
+}
