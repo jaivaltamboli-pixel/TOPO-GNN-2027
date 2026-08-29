@@ -1,0 +1,140 @@
+{
+  "metadata": {
+    "test_distances": [
+      9,
+      11,
+      13
+    ],
+    "physical_error_rate": 0.002,
+    "bias_eta": 100.0,
+    "shots_per_distance": 1000
+  },
+  "results": {
+    "9": {
+      "MWPM (Classical Baseline)": {
+        "logical_error": 0.0,
+        "ci_lower": 2.168404344971009e-19,
+        "ci_upper": 0.0038267584855551234,
+        "errors": 0,
+        "shots": 1000,
+        "latency_ms": 22.95660972595215
+      },
+      "Topo-DephaseGNN (Proposed)": {
+        "logical_error": 0.123,
+        "ci_lower": 0.10407414325107295,
+        "ci_upper": 0.1448112326470356,
+        "errors": 123,
+        "shots": 1000,
+        "latency_ms": 2077.5052905082703
+      },
+      "Lange-inspired MPNN": {
+        "logical_error": 0.168,
+        "ci_lower": 0.14610794675394784,
+        "ci_upper": 0.19243302088046083,
+        "errors": 168,
+        "shots": 1000,
+        "latency_ms": 2077.5052905082703
+      },
+      "ST-GNN-inspired Net": {
+        "logical_error": 0.188,
+        "ci_lower": 0.16499470988376858,
+        "ci_upper": 0.21339318741121788,
+        "errors": 188,
+        "shots": 1000,
+        "latency_ms": 2077.5052905082703
+      },
+      "Neural BP-inspired Net": {
+        "logical_error": 0.35,
+        "ci_lower": 0.32106271005247566,
+        "ci_upper": 0.38008531749319086,
+        "errors": 350,
+        "shots": 1000,
+        "latency_ms": 2077.5052905082703
+      }
+    },
+    "11": {
+      "MWPM (Classical Baseline)": {
+        "logical_error": 0.001,
+        "ci_lower": 0.00017654637062607809,
+        "ci_upper": 0.0056425585979579355,
+        "errors": 1,
+        "shots": 1000,
+        "latency_ms": 44.11911964416504
+      },
+      "Topo-DephaseGNN (Proposed)": {
+        "logical_error": 0.208,
+        "ci_lower": 0.1839846957823808,
+        "ci_upper": 0.23425013117318338,
+        "errors": 208,
+        "shots": 1000,
+        "latency_ms": 1837.4285697937012
+      },
+      "Lange-inspired MPNN": {
+        "logical_error": 0.255,
+        "ci_lower": 0.2289585370509225,
+        "ci_upper": 0.2829165746069995,
+        "errors": 255,
+        "shots": 1000,
+        "latency_ms": 1837.4285697937012
+      },
+      "ST-GNN-inspired Net": {
+        "logical_error": 0.264,
+        "ci_lower": 0.23761996823603918,
+        "ci_upper": 0.29218626176914286,
+        "errors": 264,
+        "shots": 1000,
+        "latency_ms": 1837.4285697937012
+      },
+      "Neural BP-inspired Net": {
+        "logical_error": 0.413,
+        "ci_lower": 0.3828725319393248,
+        "ci_upper": 0.44379332403716176,
+        "errors": 413,
+        "shots": 1000,
+        "latency_ms": 1837.4285697937012
+      }
+    },
+    "13": {
+      "MWPM (Classical Baseline)": {
+        "logical_error": 0.0,
+        "ci_lower": 2.168404344971009e-19,
+        "ci_upper": 0.0038267584855551234,
+        "errors": 0,
+        "shots": 1000,
+        "latency_ms": 132.41195678710938
+      },
+      "Topo-DephaseGNN (Proposed)": {
+        "logical_error": 0.316,
+        "ci_lower": 0.28793562210416745,
+        "ci_upper": 0.34547262501851683,
+        "errors": 316,
+        "shots": 1000,
+        "latency_ms": 2171.0590720176697
+      },
+      "Lange-inspired MPNN": {
+        "logical_error": 0.344,
+        "ci_lower": 0.3152044922028449,
+        "ci_upper": 0.37398945644464826,
+        "errors": 344,
+        "shots": 1000,
+        "latency_ms": 2171.0590720176697
+      },
+      "ST-GNN-inspired Net": {
+        "logical_error": 0.335,
+        "ci_lower": 0.30642688114062866,
+        "ci_upper": 0.3648359491596046,
+        "errors": 335,
+        "shots": 1000,
+        "latency_ms": 2171.0590720176697
+      },
+      "Neural BP-inspired Net": {
+        "logical_error": 0.482,
+        "ci_lower": 0.4511584546689284,
+        "ci_upper": 0.5129793086365515,
+        "errors": 482,
+        "shots": 1000,
+        "latency_ms": 2171.0590720176697
+      }
+    }
+  }
+}

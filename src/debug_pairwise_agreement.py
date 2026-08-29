@@ -1,269 +1,152 @@
 import os
 os.environ["NETWORKX_AUTOMATIC_BACKENDS"] = ""
 
+import torch
+import numpy as np
 import stim
 import pymatching
-import numpy as np
-import torch
-import torch.nn as nn
-from scipy.stats import norm
-import itertools
 
-def wilson_score_interval(k, n, confidence=0.95):
-    if n == 0:
-        return 0.0, 0.0, 0.0
-    z = norm.ppf(1 - (1 - confidence) / 2)
-    p_hat = k / n
-    denom = 1 + (z**2) / n
-    centre = (p_hat + (z**2) / (2 * n)) / denom
-    spread = (z * np.sqrt((p_hat * (1 - p_hat) / n) + ((z**2) / (4 * n**2)))) / denom
-    return p_hat, max(0.0, centre - spread), min(1.0, centre + spread)
+from utils.noise_circuits import make_biased_surface_code
+from utils.graph_builder import extract_complete_dem_graph, extract_active_subgraph_tensors
+from models import TopoDephaseGNN
 
-def make_biased_surface_code(d=5, rounds=5, p_total=0.002, eta=100.0):
-    p_z = p_total * (eta / (eta + 1.0))
-    p_x = p_total / (2.0 * (eta + 1.0))
-    p_y = p_x
-
-    base = stim.Circuit.generated(
-        "surface_code:rotated_memory_x",
-        distance=d,
-        rounds=rounds,
-        after_clifford_depolarization=0.0
-    ).flattened()
-
-    noisy = stim.Circuit()
-    for inst in base:
-        noisy.append(inst)
-        if inst.name in ["TICK", "R", "MR", "M", "DETECTOR", "OBSERVABLE_INCLUDE", "QUBIT_COORDS", "SHIFT_COORDS"]:
-            continue
-        targets = inst.targets_copy()
-        if len(targets) > 0:
-            noisy.append("PAULI_CHANNEL_1", targets, [p_x, p_y, p_z])
-    return noisy.flattened()
-
-# --- Model Definitions with Architecture-Specific Inductive Biases ---
-class LangeIsotropicMPNN(nn.Module):
-    def __init__(self, in_dim=4, hidden=64):
-        super().__init__()
-        self.node_embed = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU())
-        self.msg = nn.Sequential(nn.Linear(hidden * 2, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
-        self.head = nn.Sequential(nn.Linear(hidden, 1), nn.Sigmoid())
-
-    def forward(self, x, edge_index):
-        h = self.node_embed(x)
-        if edge_index.numel() == 0:
-            return torch.tensor([[0.0]], device=x.device)
-        src, dst = edge_index
-        m = self.msg(torch.cat([h[src], h[dst]], dim=-1))
-        agg = torch.zeros_like(h)
-        agg.index_add_(0, dst, m)
-        return self.head((h + agg).mean(dim=0, keepdim=True))
-
-class NeuralBP(nn.Module):
-    def __init__(self, hidden=32, iters=3):
-        super().__init__()
-        self.iters = iters
-        self.f = nn.Sequential(nn.Linear(1, hidden), nn.Tanh(), nn.Linear(hidden, 1))
-        self.head = nn.Sequential(nn.Linear(1, 1), nn.Sigmoid())
-
-    def forward(self, s):
-        x = s * 2.0 - 1.0
-        msg = torch.zeros_like(x)
-        for _ in range(self.iters):
-            msg = self.f(x + msg)
-        return self.head((x + msg).mean(dim=0, keepdim=True))
-
-class STGNN(nn.Module):
-    def __init__(self, in_dim=4, hidden=64):
-        super().__init__()
-        self.conv = nn.Sequential(nn.Linear(in_dim * 2, hidden), nn.SiLU())
-        self.gru = nn.GRUCell(hidden, hidden)
-        self.head = nn.Sequential(nn.Linear(hidden, 1), nn.Sigmoid())
-
-    def forward(self, x, edge_index):
-        if edge_index.numel() == 0:
-            return torch.tensor([[0.0]], device=x.device)
-        src, dst = edge_index
-        m = self.conv(torch.cat([x[src], x[dst]], dim=-1))
-        agg = torch.zeros((x.size(0), m.size(1)), device=x.device)
-        agg.index_add_(0, dst, m)
-        return self.head(self.gru(agg).mean(dim=0, keepdim=True))
-
-class TopoDephaseGNN(nn.Module):
-    def __init__(self, in_dim=6, hidden=64):
-        super().__init__()
-        self.node_embed = nn.Sequential(nn.Linear(in_dim, hidden), nn.SiLU())
-        self.msg_par = nn.Sequential(nn.Linear(hidden * 2 + 1, hidden), nn.SiLU(), nn.Linear(hidden, hidden))
-        self.msg_tra = nn.Sequential(nn.Linear(hidden * 2 + 1, hidden), nn.SiLU(), nn.Linear(hidden, hidden))
-        self.head = nn.Sequential(nn.Linear(hidden * 2, 1), nn.Sigmoid())
-
-    def forward(self, x, edge_index, edge_attr, is_par):
-        h = self.node_embed(x)
-        if edge_index.numel() == 0:
-            return torch.tensor([[0.0]], device=x.device)
-        src, dst = edge_index
-        f = torch.cat([h[src], h[dst], edge_attr], dim=-1)
-        msgs = torch.where(is_par.unsqueeze(-1), self.msg_par(f), self.msg_tra(f))
-        agg = torch.zeros_like(h)
-        agg.index_add_(0, dst, msgs)
-        pool = torch.cat([h[src].mean(dim=0, keepdim=True), h[dst].mean(dim=0, keepdim=True)], dim=-1)
-        return self.head(pool)
-
-# --- Balanced Batch Training ---
-def train_balanced(models, circuit, device, steps=350):
-    print("[*] Training models with balanced active error chain sampling...")
-    opt = {k: torch.optim.AdamW(v.parameters(), lr=1.5e-3) for k, v in models.items()}
-    crit = nn.BCELoss()
-    sampler = circuit.compile_detector_sampler()
-    det_coords = circuit.get_detector_coordinates()
-    num_dets = circuit.num_detectors
-
-    for _ in range(steps):
-        syn, flips = sampler.sample(shots=64, separate_observables=True)
-        for i in range(len(syn)):
-            s_vec = syn[i]
-            active = np.where(s_vec)[0]
-            if len(active) < 2:
-                continue
-
-            node_4d = np.zeros((num_dets, 4), dtype=np.float32)
-            node_6d = np.zeros((num_dets, 6), dtype=np.float32)
-            for d_idx in range(num_dets):
-                c = det_coords.get(d_idx, [0, 0, 0])
-                node_4d[d_idx, 0] = s_vec[d_idx]
-                node_4d[d_idx, 1:4] = c[:3]
-                node_6d[d_idx, 0] = s_vec[d_idx]
-                node_6d[d_idx, 1:4] = c[:3]
-                node_6d[d_idx, 4] = c[0]
-                node_6d[d_idx, 5] = c[1]
-
-            src, dst, is_par, attrs = [], [], [], []
-            for a in range(len(active) - 1):
-                u, v = active[a], active[a+1]
-                cu, cv = det_coords.get(u, [0,0,0]), det_coords.get(v, [0,0,0])
-                src.append(u); dst.append(v)
-                is_par.append(abs(cu[1] - cv[1]) > abs(cu[0] - cv[0]))
-                attrs.append([float(np.linalg.norm(np.array(cu) - np.array(cv)))])
-
-            x4 = torch.tensor(node_4d, dtype=torch.float32, device=device)
-            x6 = torch.tensor(node_6d, dtype=torch.float32, device=device)
-            e_idx = torch.tensor([src, dst], dtype=torch.long, device=device)
-            e_attr = torch.tensor(attrs, dtype=torch.float32, device=device)
-            e_par = torch.tensor(is_par, dtype=torch.bool, device=device)
-            s_t = torch.tensor(s_vec, dtype=torch.float32, device=device).unsqueeze(-1)
-            target = torch.tensor([[flips[i, 0]]], dtype=torch.float32, device=device)
-
-            for name, m in models.items():
-                opt[name].zero_grad()
-                if name == "Lange MPNN":
-                    pred = m(x4, e_idx)
-                elif name == "Neural BP":
-                    pred = m(s_t)
-                elif name == "ST-GNN":
-                    pred = m(x4, e_idx)
-                elif name == "Topo-DephaseGNN":
-                    pred = m(x6, e_idx, e_attr, e_par)
-                loss = crit(pred, target)
-                loss.backward()
-                opt[name].step()
-
-    for m in models.values():
-        m.eval()
-    print("[+] Training complete.\n")
-
-def run_diagnostic(shots=30000):
+def evaluate_deterministic_batch(d=9, p_val=0.002, eta=100.0, shots=500, seed=42):
+    # Set deterministic seeds
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("=" * 80)
-    print(f"DECODER PAIRWISE AGREEMENT & ERROR DIAGNOSTIC (Shots={shots:,})")
-    print("=" * 80 + "\n")
 
-    circuit = make_biased_surface_code(d=5, rounds=5, p_total=0.002, eta=100.0)
+    os.makedirs("results", exist_ok=True)
+    print("=" * 105)
+    print(f"DETERMINISTIC 3-WAY COUNTERFACTUAL AUDIT (d={d}, shots={shots}, seed={seed})")
+    print("=" * 105 + "\n")
+
+    model = TopoDephaseGNN().to(device)
+    model.load_state_dict(torch.load("checkpoints/topo_dephase_gnn.pt", map_location=device))
+    model.eval()
+
+    circuit = make_biased_surface_code(d=d, rounds=d, p_total=p_val, eta=eta)
     dem = circuit.detector_error_model(decompose_errors=True)
-    matcher = pymatching.Matching.from_detector_error_model(dem)
-    sampler = circuit.compile_detector_sampler()
-    det_coords = circuit.get_detector_coordinates()
+    coords = circuit.get_detector_coordinates()
     num_dets = circuit.num_detectors
+    edge_dict, bnd_z_idx, bnd_x_idx, _ = extract_complete_dem_graph(dem, num_dets, coords, d)
 
-    models = {
-        "Lange MPNN": LangeIsotropicMPNN().to(device),
-        "Neural BP": NeuralBP().to(device),
-        "ST-GNN": STGNN().to(device),
-        "Topo-DephaseGNN": TopoDephaseGNN().to(device)
-    }
-
-    train_balanced(models, circuit, device, steps=300)
-
+    sampler = circuit.compile_detector_sampler(seed=seed)
     syn, flips = sampler.sample(shots=shots, separate_observables=True)
-    flips = flips.flatten()
+    flips = flips.flatten().astype(np.int64)
 
-    # Base MWPM
-    mwpm_preds = matcher.decode_batch(syn).flatten()
+    np.save("results/debug_syn.npy", syn)
+    np.save("results/debug_flips.npy", flips)
 
-    all_preds = {
-        "MWPM": mwpm_preds,
-        "Lange MPNN": mwpm_preds.copy(),
-        "Neural BP": mwpm_preds.copy(),
-        "ST-GNN": mwpm_preds.copy(),
-        "Topo-DephaseGNN": mwpm_preds.copy()
-    }
+    base_matcher = pymatching.Matching.from_detector_error_model(dem)
+    preds_base = base_matcher.decode_batch(syn).flatten().astype(np.int64)
+    preds_lower = preds_base.copy()
+    preds_higher = preds_base.copy()
 
-    complex_idx = np.where(np.sum(syn, axis=1) >= 2)[0]
-    print(f"Total Shots: {shots:,} | Multi-Defect Complex Clusters: {len(complex_idx):,} ({len(complex_idx)/shots*100:.2f}%)\n")
+    active_shots = np.where(np.sum(syn, axis=1) >= 2)[0]
+    first_divergence_logged = False
 
-    for idx in complex_idx:
-        s_vec = syn[idx]
-        active = np.where(s_vec)[0]
-
-        node_4d = np.zeros((num_dets, 4), dtype=np.float32)
-        node_6d = np.zeros((num_dets, 6), dtype=np.float32)
-        for d_idx in range(num_dets):
-            c = det_coords.get(d_idx, [0, 0, 0])
-            node_4d[d_idx, 0] = s_vec[d_idx]
-            node_4d[d_idx, 1:4] = c[:3]
-            node_6d[d_idx, 0] = s_vec[d_idx]
-            node_6d[d_idx, 1:4] = c[:3]
-            node_6d[d_idx, 4] = c[0]
-            node_6d[d_idx, 5] = c[1]
-
-        src, dst, is_par, attrs = [], [], [], []
-        for a in range(len(active) - 1):
-            u, v = active[a], active[a+1]
-            cu, cv = det_coords.get(u, [0,0,0]), det_coords.get(v, [0,0,0])
-            src.append(u); dst.append(v)
-            is_par.append(abs(cu[1] - cv[1]) > abs(cu[0] - cv[0]))
-            attrs.append([float(np.linalg.norm(np.array(cu) - np.array(cv)))])
-
-        x4 = torch.tensor(node_4d, dtype=torch.float32, device=device)
-        x6 = torch.tensor(node_6d, dtype=torch.float32, device=device)
-        e_idx = torch.tensor([src, dst], dtype=torch.long, device=device)
-        e_attr = torch.tensor(attrs, dtype=torch.float32, device=device)
-        e_par = torch.tensor(is_par, dtype=torch.bool, device=device)
-        s_t = torch.tensor(s_vec, dtype=torch.float32, device=device).unsqueeze(-1)
+    for idx in active_shots:
+        s = syn[idx].astype(np.uint8)
+        x4, x6, e_idx, e_attr, e_par, s_t, _, global_pairs = extract_active_subgraph_tensors(
+            s, coords, edge_dict, bnd_z_idx, bnd_x_idx, d, device
+        )
+        if e_idx.numel() == 0:
+            continue
 
         with torch.no_grad():
-            all_preds["Lange MPNN"][idx] = int(models["Lange MPNN"](x4, e_idx).item() > 0.5)
-            all_preds["Neural BP"][idx] = int(models["Neural BP"](s_t).item() > 0.5)
-            all_preds["ST-GNN"][idx] = int(models["ST-GNN"](x4, e_idx).item() > 0.5)
-            
-            p_topo = models["Topo-DephaseGNN"](x6, e_idx, e_attr, e_par).item()
-            all_preds["Topo-DephaseGNN"][idx] = int(p_topo > 0.5)
+            _, edge_logits = model(x6, e_idx, e_attr, e_par)
+            if edge_logits.numel() == 0:
+                continue
+            probs = torch.sigmoid(edge_logits).cpu().numpy().flatten()
 
-    # 1. Error Rate Table
-    print(f"{'Decoder':<20} | {'Logical Error Rate':<18} | {'Errors (k)':<10}")
-    print("-" * 55)
-    for name, p_vec in all_preds.items():
-        k = int(np.sum(p_vec != flips))
-        p_hat, l, u = wilson_score_interval(k, shots)
-        print(f"{name:<20} | {p_hat*100:6.3f}% [{l*100:.2f}%, {u*100:.2f}%] | {k:>4d}/{shots}")
-    print("=" * 55 + "\n")
+        processed = set()
+        edges_to_mod = []
 
-    # 2. Pairwise Prediction Agreement Matrix
-    print("Pairwise Prediction Agreement (% of identical predictions across 30,000 shots):")
-    names = list(all_preds.keys())
-    print(f"{'':<18}" + "".join([f"{n[:10]:>12}" for n in names]))
-    for n1 in names:
-        row = [f"{np.mean(all_preds[n1] == all_preds[n2])*100:11.2f}%" for n2 in names]
-        print(f"{n1:<18}" + "".join(row))
+        for k_e, pair in enumerate(global_pairs):
+            u, v = int(pair[0]), int(pair[1])
+            canon = tuple(sorted((u, v)))
+            if canon in processed:
+                continue
+            processed.add(canon)
+
+            rev_idx = [j for j, gp in enumerate(global_pairs) if {int(gp[0]), int(gp[1])} == {u, v}]
+            p_edge = float(np.mean(probs[rev_idx])) if len(rev_idx) > 0 else float(probs[k_e])
+
+            if p_edge >= 0.95:
+                props = edge_dict.get(canon)
+                if props is not None:
+                    edges_to_mod.append({
+                        "u": u, "v": v, "canon": canon,
+                        "p": p_edge,
+                        "base_w": float(props["weight"]),
+                        "has_obs": props.get("has_obs", False)
+                    })
+
+        if len(edges_to_mod) > 0:
+            matcher_low = pymatching.Matching.from_detector_error_model(dem)
+            matcher_high = pymatching.Matching.from_detector_error_model(dem)
+
+            for item in edges_to_mod:
+                u, v = item["u"], item["v"]
+                base_w = item["base_w"]
+                w_low = max(0.01, base_w * 0.85)
+                w_high = base_w * 1.15
+                fault_ids = {0} if item["has_obs"] else set()
+
+                if u == bnd_z_idx or u == bnd_x_idx:
+                    if v < num_dets:
+                        matcher_low.add_boundary_edge(v, weight=w_low, fault_ids=fault_ids, merge_strategy="replace")
+                        matcher_high.add_boundary_edge(v, weight=w_high, fault_ids=fault_ids, merge_strategy="replace")
+                elif v == bnd_z_idx or v == bnd_x_idx:
+                    if u < num_dets:
+                        matcher_low.add_boundary_edge(u, weight=w_low, fault_ids=fault_ids, merge_strategy="replace")
+                        matcher_high.add_boundary_edge(u, weight=w_high, fault_ids=fault_ids, merge_strategy="replace")
+                else:
+                    matcher_low.add_edge(u, v, weight=w_low, fault_ids=fault_ids, merge_strategy="replace")
+                    matcher_high.add_edge(u, v, weight=w_high, fault_ids=fault_ids, merge_strategy="replace")
+
+            p_l = int(matcher_low.decode(s)[0])
+            p_h = int(matcher_high.decode(s)[0])
+            preds_lower[idx] = p_l
+            preds_higher[idx] = p_h
+
+            if (p_l != preds_base[idx] or p_h != preds_base[idx]) and not first_divergence_logged:
+                first_divergence_logged = True
+                print("=" * 60)
+                print(f"FIRST DIVERGENT SHOT FOUND: Shot #{idx}")
+                print("=" * 60)
+                print(f"  Ground Truth Observable Flip:   {flips[idx]}")
+                print(f"  Base MWPM Prediction:          {preds_base[idx]}")
+                print(f"  Lower-Cost Hybrid Prediction:   {p_l}")
+                print(f"  Higher-Cost Hybrid Prediction:  {p_h}")
+                print(f"  Modified Edges ({len(edges_to_mod)} total):")
+                for e in edges_to_mod[:8]:
+                    print(f"    ({e['u']:>3d}, {e['v']:>3d}) | p={e['p']:.4f} | base_w={e['base_w']:.3f} | has_obs={e['has_obs']}")
+                print("=" * 60 + "\n")
+
+    # Metrics
+    all_three_agree = int(np.sum((preds_base == preds_lower) & (preds_base == preds_higher)))
+    base_diff_lower = int(np.sum(preds_base != preds_lower))
+    base_diff_higher = int(np.sum(preds_base != preds_higher))
+    lower_diff_higher = int(np.sum(preds_lower != preds_higher))
+
+    err_base = int(np.sum(preds_base != flips))
+    err_lower = int(np.sum(preds_lower != flips))
+    err_higher = int(np.sum(preds_higher != flips))
+
+    print("============================================================")
+    print("DETERMINISTIC PAIRWISE AGREEMENT SUMMARY")
+    print("============================================================")
+    print(f"  All Three Decoders Agree:           {all_three_agree:>3d}/{shots} ({all_three_agree/shots*100:6.2f}%)")
+    print(f"  Base MWPM != Lower-Cost (Mode A):   {base_diff_lower:>3d}/{shots} ({base_diff_lower/shots*100:6.2f}%)")
+    print(f"  Base MWPM != Higher-Cost (Mode B):  {base_diff_higher:>3d}/{shots} ({base_diff_higher/shots*100:6.2f}%)")
+    print(f"  Lower-Cost != Higher-Cost (A != B): {lower_diff_higher:>3d}/{shots} ({lower_diff_higher/shots*100:6.2f}%)")
+    print("-" * 60)
+    print(f"  Base MWPM Logical Errors:           {err_base:>3d}/{shots} ({err_base/shots*100:6.3f}%)")
+    print(f"  Lower-Cost Prior Logical Errors:    {err_lower:>3d}/{shots} ({err_lower/shots*100:6.3f}%)")
+    print(f"  Higher-Cost Prior Logical Errors:   {err_higher:>3d}/{shots} ({err_higher/shots*100:6.3f}%)")
+    print("============================================================\n")
 
 if __name__ == "__main__":
-    run_diagnostic()
+    evaluate_deterministic_batch()

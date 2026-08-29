@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class LangeIsotropicMPNN(nn.Module):
-    """6-hop Isotropic Relational MPNN baseline."""
     def __init__(self, in_features=4, hidden_dim=64, num_layers=6):
         super().__init__()
         self.node_embed = nn.Sequential(nn.Linear(in_features, hidden_dim), nn.SiLU())
@@ -40,7 +39,6 @@ class LangeIsotropicMPNN(nn.Module):
         return self.readout(pooled)
 
 class NeuralBeliefPropagation(nn.Module):
-    """6-iteration Neural BP-inspired factor recurrent network."""
     def __init__(self, hidden_dim=48, iters=6):
         super().__init__()
         self.iters = iters
@@ -58,7 +56,6 @@ class NeuralBeliefPropagation(nn.Module):
         return self.readout(msg.mean(dim=0, keepdim=True))
 
 class SpatioTemporalGNN(nn.Module):
-    """Spatio-Temporal GNN baseline."""
     def __init__(self, in_features=4, hidden_dim=64):
         super().__init__()
         self.spatial = nn.Sequential(nn.Linear(in_features * 2 + 4, hidden_dim), nn.SiLU())
@@ -93,25 +90,23 @@ class AnisotropicRelationalLayer(nn.Module):
         return self.norm(h + agg)
 
 class TopoDephaseGNN(nn.Module):
-    """6-hop Anisotropic Relational MPNN with Dual Graph & Edge Modulation Heads."""
     def __init__(self, in_features=6, hidden_dim=64, num_layers=6):
         super().__init__()
         self.node_embed = nn.Sequential(nn.Linear(in_features, hidden_dim), nn.SiLU())
         self.layers = nn.ModuleList([AnisotropicRelationalLayer(hidden_dim) for _ in range(num_layers)])
         
-        # Output Head A: Logical Coset Classifier
+        # Head A: Global Logical Coset Classifier
         self.logical_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, 1),
             nn.Sigmoid()
         )
-        # Output Head B: Physical Edge LLR Modulation
-        self.edge_mod_head = nn.Sequential(
+        # Head B: Unbounded Local Physical Edge Logit Estimator
+        self.edge_delta_head = nn.Sequential(
             nn.Linear(hidden_dim * 2 + 4, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.Tanh()  # Produces bounded delta_w in [-1.0, 1.0]
+            nn.Linear(hidden_dim, 1) # Raw, unconstrained linear log-odds for BCEWithLogitsLoss
         )
 
     def forward(self, node_feats, edge_index, edge_attr, is_parallel):
@@ -128,6 +123,6 @@ class TopoDephaseGNN(nn.Module):
         logical_pred = self.logical_head(pooled)
         
         edge_repr = torch.cat([h[src], h[dst], edge_attr], dim=-1)
-        delta_w = self.edge_mod_head(edge_repr) * 1.5  # Scale factor for PyMatching LLR
+        edge_logits = self.edge_delta_head(edge_repr)
         
-        return logical_pred, delta_w
+        return logical_pred, edge_logits
