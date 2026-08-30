@@ -45,11 +45,9 @@ def collect_shot_indexed_dataset(distances, p_val, eta, total_shots, device):
         syn, flips = sampler.sample(shots=total_shots, separate_observables=True)
         flips = flips.flatten().astype(np.int64)
 
-        # Base MWPM predictions & failure ground truth
         preds_mwpm = matcher.decode_batch(syn).flatten().astype(np.int64)
         mwpm_wrong = (preds_mwpm != flips).astype(np.int64)
 
-        # Store tensors indexed by their original shot index
         tensors_by_shot = {}
         active_indices = np.where(np.sum(syn, axis=1) >= 2)[0]
 
@@ -72,12 +70,20 @@ def collect_shot_indexed_dataset(distances, p_val, eta, total_shots, device):
         print(f"  [+] Collected d={d:2d} ({total_shots:,} shots, {np.sum(mwpm_wrong):>4d} failures, {len(tensors_by_shot):,d} active subgraphs) in {time.time()-t0:.2f}s")
     return dataset
 
-def train_failure_gate_gnn(train_data, train_distances, epochs=10, lr=3e-4, device="cuda"):
+def train_or_load_failure_gate(train_data, train_distances, target_epochs=3, lr=3e-4, device="cuda"):
     """
-    Trains TopoDephaseGNN strictly on balanced failure classification without any candidate features.
+    Loads epoch-3 checkpoint if present; otherwise trains for exactly 3 epochs, saving after every epoch.
     """
-    print("\n[Phase F - Step 1] Training TopoDephaseGNN Failure Gate on balanced mini-batches...")
+    ckpt_path = "checkpoints/topo_failure_gate_epoch3.pt"
     model = TopoDephaseGNN().to(device)
+
+    if os.path.exists(ckpt_path):
+        print(f"\n[Phase F - Step 1] Found existing checkpoint '{ckpt_path}'. Loading directly...")
+        model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        model.eval()
+        return model
+
+    print(f"\n[Phase F - Step 1] Checkpoint not found. Running lightweight training ({target_epochs} epochs with per-epoch saves)...")
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = nn.BCELoss()
 
@@ -99,7 +105,7 @@ def train_failure_gate_gnn(train_data, train_distances, epochs=10, lr=3e-4, devi
     batch_neg = 64
     steps_per_epoch = 400
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(1, target_epochs + 1):
         model.train()
         total_loss = 0.0
         t0 = time.time()
@@ -124,10 +130,10 @@ def train_failure_gate_gnn(train_data, train_distances, epochs=10, lr=3e-4, devi
             optimizer.step()
             total_loss += batch_loss.item()
 
-        print(f"  Epoch {epoch:2d}/{epochs:2d} | Balanced BCE Loss: {total_loss/steps_per_epoch:6.4f} | Time: {time.time()-t0:5.2f}s")
+        epoch_save_path = f"checkpoints/topo_failure_gate_epoch{epoch}.pt"
+        torch.save(model.state_dict(), epoch_save_path)
+        print(f"  Epoch {epoch:2d}/{target_epochs:2d} | Balanced BCE Loss: {total_loss/steps_per_epoch:6.4f} | Saved: {epoch_save_path} | Time: {time.time()-t0:5.2f}s")
 
-    torch.save(model.state_dict(), "checkpoints/topo_failure_gate.pt")
-    print("  [+] Saved gate checkpoint to checkpoints/topo_failure_gate.pt\n")
     return model
 
 def evaluate_gated_decoder(
@@ -135,20 +141,20 @@ def evaluate_gated_decoder(
     test_distance=9,
     p_val=0.002,
     eta=100.0,
-    train_shots_per_dist=120000,
+    train_shots_per_dist=100000,
     test_shots=100000
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=" * 130)
-    print(f"PHASE F: END-TO-END GNN-GATED DUAL-CANDIDATE DECODER EVALUATION")
+    print(f"PHASE F: EPOCH-3 GNN-GATED DUAL-CANDIDATE DECODER EVALUATION")
     print(f"Configuration: p={p_val}, Bias eta={eta}, Train Distances: {train_distances}, Zero-Shot Held-Out: d={test_distance}")
     print("=" * 130 + "\n")
 
     print("[Step 1/4] Preparing dataset for training distances...")
     train_data = collect_shot_indexed_dataset(train_distances, p_val, eta, train_shots_per_dist, device)
 
-    # Train Failure Gate
-    model = train_failure_gate_gnn(train_data, train_distances, epochs=10, lr=3e-4, device=device)
+    # Train or load epoch-3 model
+    model = train_or_load_failure_gate(train_data, train_distances, target_epochs=3, lr=3e-4, device=device)
     model.eval()
 
     print("[Step 2/4] Generating independent evaluation datasets (with held-out zero-shot d=9)...")
@@ -177,7 +183,6 @@ def evaluate_gated_decoder(
         oracle_preds = preds_mwpm.copy()
         for idx in range(shots):
             if mwpm_wrong[idx] == 1:
-                # Oracle flips decision to C_B
                 s = syn[idx].astype(np.uint8)
                 edges_a_raw = matcher.decode_to_edges_array(s)
                 C_A = set(standardize_edge(int(e[0]), int(e[1]), bnd_z, bnd_x) for e in edges_a_raw)
@@ -196,7 +201,6 @@ def evaluate_gated_decoder(
     print("=" * 130 + "\n")
 
     tau_sweep = [0.01, 0.02, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 0.95, 0.98, 0.99]
-
     optimal_results = []
 
     for d in eval_distances:
@@ -214,14 +218,12 @@ def evaluate_gated_decoder(
         syn = dat["syn"]
         tensors_by_shot = dat["tensors_by_shot"]
 
-        # 1. Compute predicted failure probabilities for all shots (0.0 for inactive shots)
         pred_probs = np.zeros(shots, dtype=np.float64)
         for idx, (x6, e_idx, e_attr, e_par) in tensors_by_shot.items():
             with torch.no_grad():
                 prob, _ = model(x6.to(device), e_idx.to(device), e_attr.to(device), e_par.to(device))
                 pred_probs[idx] = prob.item()
 
-        # Classification curve diagnostics
         auroc = roc_auc_score(mwpm_wrong, pred_probs) if np.sum(mwpm_wrong) > 0 else 0.0
         precisions, recalls, _ = precision_recall_curve(mwpm_wrong, pred_probs)
         auprc = auc(recalls, precisions) if np.sum(mwpm_wrong) > 0 else 0.0
@@ -233,7 +235,6 @@ def evaluate_gated_decoder(
         best_net_gain = -float("inf")
         best_row = None
 
-        # Precompute C_B observable for active shots to enable vectorized threshold sweeps
         obs_B_cache = {}
         for idx in tensors_by_shot.keys():
             s = syn[idx].astype(np.uint8)
@@ -253,12 +254,10 @@ def evaluate_gated_decoder(
             gated_errs = int(np.sum(gated_preds != flips))
             mwpm_errs = int(np.sum(preds_mwpm != flips))
 
-            diff_mask = (gated_preds != preds_mwpm)
             rec = int(np.sum((preds_mwpm != flips) & (gated_preds == flips)))
             reg = int(np.sum((preds_mwpm == flips) & (gated_preds != flips)))
             net_gain = rec - reg
 
-            # Gate classification metrics at tau
             pred_fail_binary = (pred_probs >= tau).astype(np.int64)
             tp = int(np.sum((pred_fail_binary == 1) & (mwpm_wrong == 1)))
             fp = int(np.sum((pred_fail_binary == 1) & (mwpm_wrong == 0)))
