@@ -196,5 +196,119 @@ def run_phase_a_d_audit(distances=[3, 5, 7, 9], p_val=0.002, eta=100.0, audit_sh
     print("PHASE A–D COMPLETE: Opportunity ceiling confirmed. Ready for neural candidate ranker.")
     print("=" * 115 + "\n")
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class RelationalMessageLayer(nn.Module):
+    def __init__(self, hidden_dim=64, in_edge_dim=4):
+        super().__init__()
+        msg_dim = hidden_dim * 2 + in_edge_dim + 1
+        self.msg_mlp = nn.Sequential(nn.Linear(msg_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim))
+        self.node_update = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim))
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, h, edge_index, edge_attr, is_par):
+        if edge_index.shape[1] == 0:
+            return h
+        src, dst = edge_index[0].long(), edge_index[1].long()
+        msg_input = torch.cat([h[src], h[dst], edge_attr, is_par], dim=-1)
+        messages = self.msg_mlp(msg_input)
+        agg = torch.zeros_like(h)
+        agg.index_add_(0, dst, messages)
+        return self.norm(h + self.node_update(torch.cat([h, agg], dim=-1)))
+
+
+class MultiscaleTopoOracle(nn.Module):
+    def __init__(self, in_node_dim=6, in_edge_dim=4, hidden_dim=64, num_layers=6, bins=3):
+        super().__init__()
+        self.bins = bins
+        local_layers = num_layers // 2
+        coarse_layers = num_layers - local_layers
+        
+        self.node_embed = nn.Sequential(nn.Linear(in_node_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim))
+        self.local_layers = nn.ModuleList([RelationalMessageLayer(hidden_dim, in_edge_dim) for _ in range(local_layers)])
+        
+        self.pool_mlp = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.GELU())
+        self.coarse_layers = nn.ModuleList([RelationalMessageLayer(hidden_dim, in_edge_dim) for _ in range(coarse_layers)])
+        
+        self.global_attn = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Sigmoid())
+        
+        self.edge_scorer = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + in_edge_dim + 1, hidden_dim), 
+            nn.GELU(), 
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        self.chain_energy_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        self.logical_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, x6, edge_index, edge_attr, is_par, mask_diff, batch_map=None, num_graphs=None):
+        h = self.node_embed(x6)
+        src, dst = edge_index[0].long(), edge_index[1].long()
+        for layer in self.local_layers:
+            h = layer(h, edge_index, edge_attr, is_par)
+            
+        quant = (x6[:, 0:3] * self.bins).long().clamp(0, self.bins - 1)
+        cell_id = quant[:, 0] * (self.bins**2) + quant[:, 1] * self.bins + quant[:, 2]
+        cluster_id = batch_map * (self.bins**3) + cell_id
+        _, cluster_idx = torch.unique(cluster_id, return_inverse=True)
+        num_clusters = cluster_idx.max().item() + 1
+        
+        h_pool_in = self.pool_mlp(h)
+        h_coarse = torch.zeros((num_clusters, h.shape[1]), device=h.device)
+        h_coarse.index_add_(0, cluster_idx, h_pool_in)
+        
+        c_src, c_dst = cluster_idx[src], cluster_idx[dst]
+        mask = c_src != c_dst
+        super_edge_index = torch.stack([c_src[mask], c_dst[mask]], dim=0) if mask.any() else torch.empty((2, 0), dtype=torch.long, device=h.device)
+        super_edge_attr = edge_attr[mask]
+        super_is_par = is_par[mask]
+        
+        for layer in self.coarse_layers:
+            h_coarse = layer(h_coarse, super_edge_index, super_edge_attr, super_is_par)
+            
+        attn_weights = self.global_attn(h_coarse)
+        h_coarse_attn = h_coarse * attn_weights
+        
+        coarse_batch_map = torch.zeros(num_clusters, dtype=torch.long, device=h.device)
+        coarse_batch_map[cluster_idx] = batch_map
+        
+        global_h = torch.zeros((num_graphs, h.shape[1]), device=h.device)
+        global_h.index_add_(0, coarse_batch_map, h_coarse_attn)
+        
+        h_unpooled = h_coarse[cluster_idx]
+        h_global_bcast = global_h[batch_map]
+        
+        h_combined = h + h_unpooled + h_global_bcast
+        
+        edge_feat = torch.cat([h_combined[src], h_combined[dst], edge_attr, is_par], dim=-1)
+        edge_logits = self.edge_scorer(edge_feat)
+        
+        pred_delta_w = self.chain_energy_head(global_h)
+        logical_logits = self.logical_head(global_h)
+        
+        return edge_logits, pred_delta_w, logical_logits
+
+def physics_informed_loss(edge_logits, pred_delta_w, logical_logits, target_edges, target_delta_w, target_logical, mask_diff):
+    L_logical = F.binary_cross_entropy_with_logits(logical_logits, target_logical)
+    L_chain = F.mse_loss(pred_delta_w, target_delta_w)
+    
+    cycle_mask = (mask_diff.abs() > 0).float()
+    L_topology = F.binary_cross_entropy_with_logits(edge_logits, target_edges, weight=cycle_mask) if target_edges is not None else torch.tensor(0.0, device=edge_logits.device)
+    
+    L_safety = torch.mean( F.relu( 0.75 - torch.abs(logical_logits) ) * torch.exp(-torch.abs(target_delta_w)) )
+    
+    return 1.0 * L_logical + 0.1 * L_chain + 1.0 * L_topology + 0.5 * L_safety
+
 if __name__ == "__main__":
     run_phase_a_d_audit()

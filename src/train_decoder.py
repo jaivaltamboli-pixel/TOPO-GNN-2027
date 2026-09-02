@@ -11,64 +11,37 @@ import pymatching
 
 from utils.noise_circuits import make_biased_surface_code
 from utils.graph_builder import extract_complete_dem_graph
-from audit_phase_a_d_opportunity import (
+from topo_oracle_model import (
     build_parity_expanded_graph,
     find_exact_logical_reference_chain,
     standardize_edge,
     compute_chain_observable,
-    compute_chain_weight
+    compute_chain_weight,
+    MultiscaleTopoOracle,
+    physics_informed_loss
 )
 
-class RelationalMessageLayer(nn.Module):
-    def __init__(self, hidden_dim=64, in_edge_dim=4):
-        super().__init__()
-        msg_dim = hidden_dim * 2 + in_edge_dim + 1
-        self.msg_mlp = nn.Sequential(nn.Linear(msg_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim))
-        self.node_update = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim))
-        self.norm = nn.LayerNorm(hidden_dim)
-
-    def forward(self, h, edge_index, edge_attr, is_par):
-        src, dst = edge_index[0].long(), edge_index[1].long()
-        msg_input = torch.cat([h[src], h[dst], edge_attr, is_par], dim=-1)
-        messages = self.msg_mlp(msg_input)
-        agg = torch.zeros_like(h)
-        agg.index_add_(0, dst, messages)
-        return self.norm(h + self.node_update(torch.cat([h, agg], dim=-1)))
-
-class TopoOracle(nn.Module):
-    def __init__(self, in_node_dim=6, in_edge_dim=4, hidden_dim=64, num_layers=6):
-        super().__init__()
-        self.node_embed = nn.Sequential(nn.Linear(in_node_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim))
-        self.layers = nn.ModuleList([RelationalMessageLayer(hidden_dim, in_edge_dim) for _ in range(num_layers)])
-        self.edge_scorer = nn.Sequential(nn.Linear(hidden_dim * 2 + in_edge_dim + 1, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 1), nn.Tanh())
-
-    def forward(self, x6, edge_index, edge_attr, is_par, mask_diff, batch_map=None, num_graphs=None):
-        h = self.node_embed(x6)
-        src, dst = edge_index[0].long(), edge_index[1].long()
-        for layer in self.layers:
-            h = layer(h, edge_index, edge_attr, is_par)
-        edge_feat = torch.cat([h[src], h[dst], edge_attr, is_par], dim=-1)
-        edge_bias = self.edge_scorer(edge_feat)
-        cycle_edges = (mask_diff.abs() > 0).float()
-        cycle_lens = torch.bincount(batch_map[src], weights=cycle_edges.squeeze(-1), minlength=num_graphs).unsqueeze(-1).clamp(min=1)
-        diff_energy_sum = torch.zeros((num_graphs, 1), device=h.device)
-        diff_energy_sum.index_add_(0, batch_map[src], edge_bias * mask_diff)
-        return diff_energy_sum / torch.sqrt(cycle_lens)
-
 def collate_cycle_batch(samples, device):
-    x6_list, e_idx_list, e_attr_list, e_par_list, mask_diff_list, batch_map, y_list, delta_w_list = [], [], [], [], [], [], [], []
+    x6_list, e_idx_list, e_attr_list, e_par_list, mask_diff_list, batch_map = [], [], [], [], [], []
+    target_edges_list, target_delta_w_list, target_logical_list = [], [], []
     node_offset = 0
     for i, s in enumerate(samples):
         n = s["x6"].shape[0]
         x6_list.append(s["x6"]); e_idx_list.append(s["e_idx"].long() + node_offset)
         e_attr_list.append(s["e_attr"]); e_par_list.append(s["e_par"].view(-1, 1) if s["e_par"].dim() == 1 else s["e_par"])
         mask_diff_list.append(s["mask_diff"]); batch_map.append(torch.full((n,), i, dtype=torch.long))
-        y_list.append(s["y_target"]); delta_w_list.append(s["delta_w"])
+        
+        target_edges_list.append(s["target_edges"])
+        target_delta_w_list.append(s["delta_w"])
+        target_logical_list.append(s["target_logical"])
         node_offset += n
+        
     return (torch.cat(x6_list, dim=0).to(device), torch.cat(e_idx_list, dim=1).long().to(device),
             torch.cat(e_attr_list, dim=0).to(device), torch.cat(e_par_list, dim=0).to(device),
-            torch.cat(mask_diff_list, dim=0).to(device), torch.tensor(delta_w_list, dtype=torch.float32, device=device).unsqueeze(-1),
-            torch.cat(batch_map, dim=0).long().to(device), torch.tensor(y_list, dtype=torch.float32, device=device).unsqueeze(-1), len(samples))
+            torch.cat(mask_diff_list, dim=0).to(device), torch.cat(target_edges_list, dim=0).to(device),
+            torch.cat(batch_map, dim=0).long().to(device), 
+            torch.tensor(target_delta_w_list, dtype=torch.float32, device=device).unsqueeze(-1),
+            torch.tensor(target_logical_list, dtype=torch.float32, device=device).unsqueeze(-1), len(samples))
 
 def collect_distance_cache(d, p_val, eta, shots):
     t0 = time.time()
@@ -81,7 +54,7 @@ def collect_distance_cache(d, p_val, eta, shots):
     R_L, _ = find_exact_logical_reference_chain(adj, num_dets)
     
     max_idx = max(max(u, v) for u, v in raw_edge_dict.keys())
-    num_nodes = max_idx + 1
+    num_nodes = max(max_idx + 1, bnd_z + 1, bnd_x + 1)
     base_x6 = torch.zeros((num_nodes, 6), dtype=torch.float32)
     for i, (z, x, y) in coords.items():
         base_x6[i, 0], base_x6[i, 1], base_x6[i, 2] = z / (d + 1), x / (d + 1), y / (d + 1)
@@ -109,6 +82,7 @@ def collect_distance_cache(d, p_val, eta, shots):
     preds_mwpm = matcher.decode_batch(syn).flatten().astype(np.int64)
     
     samples = []
+    VIRTUAL_BOUNDARY = -1
     for idx in np.where(np.sum(syn, axis=1) >= 2)[0]:
         s = syn[idx].astype(np.uint8)
         batch_pred = preds_mwpm[idx]
@@ -122,20 +96,57 @@ def collect_distance_cache(d, p_val, eta, shots):
         C_1 = C_B if obs_A == 0 else C_A
         w_0, w_1 = compute_chain_weight(C_0, edge_dict), compute_chain_weight(C_1, edge_dict)
         
-        x6 = base_x6.clone()
+        chain_nodes = set()
+        for u, v in C_0.union(C_1):
+            if u != VIRTUAL_BOUNDARY: chain_nodes.add(u)
+            if v != VIRTUAL_BOUNDARY: chain_nodes.add(v)
+            
         valid_nodes = np.where(s)[0]
         valid_nodes = valid_nodes[valid_nodes < num_nodes]
-        x6[valid_nodes, 5] = 1.0
         
-        mask_diff = torch.zeros((len(canon_edges), 1), dtype=torch.float32)
-        for i, canon in enumerate(canon_edges):
+        sparse_nodes = set(valid_nodes).union(chain_nodes)
+        sparse_nodes.add(bnd_z)
+        sparse_nodes.add(bnd_x)
+        sparse_nodes_list = sorted(list(sparse_nodes))
+        node_to_idx = {n: i for i, n in enumerate(sparse_nodes_list)}
+        
+        x6_sparse = base_x6[sparse_nodes_list].clone()
+        for n in valid_nodes:
+            if n in node_to_idx:
+                x6_sparse[node_to_idx[n], 5] = 1.0
+
+        src, dst, attr, par, canon_edges_sparse = [], [], [], [], []
+        for (u, v), data in raw_edge_dict.items():
+            if u in sparse_nodes and v in sparse_nodes:
+                idx_u, idx_v = node_to_idx[u], node_to_idx[v]
+                src.extend([idx_u, idx_v]); dst.extend([idx_v, idx_u])
+                w_norm = min(float(data.get('weight', 0.0)), 50.0) / 10.0 
+                e_feat = [w_norm, data.get('prob', 0.0), data.get('error_type', 0.0) / 2.0, 1.0]
+                attr.extend([e_feat, e_feat])
+                p_flag = 1.0 if data.get('is_parity', False) else 0.0
+                par.extend([p_flag, p_flag])
+                canon_edges_sparse.extend([standardize_edge(u, v, bnd_z, bnd_x), standardize_edge(v, u, bnd_z, bnd_x)])
+                
+        e_idx_sparse = torch.tensor([src, dst], dtype=torch.long)
+        e_attr_sparse = torch.tensor(attr, dtype=torch.float32)
+        e_par_sparse = torch.tensor(par, dtype=torch.float32)
+        
+        mask_diff = torch.zeros((len(canon_edges_sparse), 1), dtype=torch.float32)
+        for i, canon in enumerate(canon_edges_sparse):
             in_0, in_1 = canon in C_0, canon in C_1
             if in_1 and not in_0: mask_diff[i, 0] = 1.0
             elif in_0 and not in_1: mask_diff[i, 0] = -1.0
             
-        samples.append({"x6": x6, "e_idx": base_e_idx, "e_attr": base_e_attr, "e_par": (base_e_par.view(-1) > 0).float(),
-                        "mask_diff": mask_diff, "y_target": 1.0 if flips[idx] == 0 else -1.0, 
-                        "delta_w": w_1 - w_0, "obs_A": obs_A, "idx": idx})
+        target_edges = torch.zeros((len(canon_edges_sparse), 1), dtype=torch.float32)
+        target_logical = float(flips[idx])
+        C_true = C_0 if flips[idx] == 0 else C_1
+        for j, canon in enumerate(canon_edges_sparse):
+            if canon in C_true:
+                target_edges[j, 0] = 1.0
+                
+        samples.append({"x6": x6_sparse, "e_idx": e_idx_sparse, "e_attr": e_attr_sparse, "e_par": (e_par_sparse.view(-1) > 0).float(),
+                        "mask_diff": mask_diff, "target_edges": target_edges, 
+                        "target_logical": target_logical, "delta_w": w_1 - w_0, "obs_A": obs_A, "idx": idx})
                         
     print(f"  [+] d={d} ({shots:,} shots) mapped in {time.time()-t0:.2f}s")
     return {"samples": samples, "total_shots": shots, "preds_mwpm": preds_mwpm, "flips": flips}
@@ -157,26 +168,26 @@ def save_gate4_model():
         for s in dat["samples"]:
             if abs(s["delta_w"]) <= (4.0 * d): train_samples.append(s)
 
-    pool_fail = [s for s in train_samples if (0 if s["y_target"] == 1.0 else 1) != s["obs_A"]]
-    pool_corr = [s for s in train_samples if (0 if s["y_target"] == 1.0 else 1) == s["obs_A"]]
+    pool_fail = [s for s in train_samples if int(s["target_logical"]) != s["obs_A"]]
+    pool_corr = [s for s in train_samples if int(s["target_logical"]) == s["obs_A"]]
     print(f"  Final Training Pool: {len(pool_fail):,d} Fails | {len(pool_corr):,d} Correct Shots")
 
-    model = TopoOracle(in_node_dim=6, in_edge_dim=4, hidden_dim=64, num_layers=6).to(device)
+    model = MultiscaleTopoOracle(in_node_dim=6, in_edge_dim=4, hidden_dim=64, num_layers=6, bins=3).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=8e-4, weight_decay=1e-4)
-    criterion = nn.MSELoss()
 
-    for epoch in range(1, 13):
+
+    for epoch in range(1, 16):
         model.train(); tot_loss, correct, items = 0.0, 0, 0
         for _ in range(150):
             batch = [pool_fail[i] for i in np.random.choice(len(pool_fail), 16, replace=True)] + \
                     [pool_corr[j] for j in np.random.choice(len(pool_corr), 16, replace=True)]
-            bx6, be_idx, be_attr, be_par, bmask, _, bmap, targets, n_g = collate_cycle_batch(batch, device)
+            bx6, be_idx, be_attr, be_par, bmask, btarget_edges, bmap, btarget_delta_w, btarget_logical, n_g = collate_cycle_batch(batch, device)
             optimizer.zero_grad()
-            phi_out = model(bx6, be_idx, be_attr, be_par, bmask, batch_map=bmap, num_graphs=n_g)
-            loss = criterion(phi_out, targets)
+            edge_logits, pred_delta_w, logical_logits = model(bx6, be_idx, be_attr, be_par, bmask, batch_map=bmap, num_graphs=n_g)
+            loss = physics_informed_loss(edge_logits, pred_delta_w, logical_logits, btarget_edges, btarget_delta_w, btarget_logical, bmask)
             loss.backward(); optimizer.step()
             tot_loss += loss.item() * n_g; items += n_g
-            correct += (torch.where(phi_out > 0, 1.0, -1.0) == targets).sum().item()
+            correct += ((logical_logits > 0) == (btarget_logical > 0.5)).sum().item()
         print(f"  Epoch {epoch:2d}/12 | Loss: {tot_loss/items:.4f} | Acc: {(correct/items)*100:6.1f}%")
 
     os.makedirs("models", exist_ok=True)

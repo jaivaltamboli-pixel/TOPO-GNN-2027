@@ -12,51 +12,16 @@ import matplotlib.pyplot as plt
 
 from utils.noise_circuits import make_biased_surface_code
 from utils.graph_builder import extract_complete_dem_graph
-from audit_phase_a_d_opportunity import (
+from topo_oracle_model import (
     build_parity_expanded_graph,
     find_exact_logical_reference_chain,
     standardize_edge,
     compute_chain_observable,
-    compute_chain_weight
+    compute_chain_weight,
+    MultiscaleTopoOracle
 )
 
 # --- 1. NEURAL ARCHITECTURE ---
-class RelationalMessageLayer(nn.Module):
-    def __init__(self, hidden_dim=64, in_edge_dim=4):
-        super().__init__()
-        msg_dim = hidden_dim * 2 + in_edge_dim + 1
-        self.msg_mlp = nn.Sequential(nn.Linear(msg_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim))
-        self.node_update = nn.Sequential(nn.Linear(hidden_dim * 2, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim))
-        self.norm = nn.LayerNorm(hidden_dim)
-
-    def forward(self, h, edge_index, edge_attr, is_par):
-        src, dst = edge_index[0].long(), edge_index[1].long()
-        msg_input = torch.cat([h[src], h[dst], edge_attr, is_par], dim=-1)
-        messages = self.msg_mlp(msg_input)
-        agg = torch.zeros_like(h)
-        agg.index_add_(0, dst, messages)
-        return self.norm(h + self.node_update(torch.cat([h, agg], dim=-1)))
-
-class TopoOracle(nn.Module):
-    def __init__(self, in_node_dim=6, in_edge_dim=4, hidden_dim=64, num_layers=6):
-        super().__init__()
-        self.node_embed = nn.Sequential(nn.Linear(in_node_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, hidden_dim))
-        self.layers = nn.ModuleList([RelationalMessageLayer(hidden_dim, in_edge_dim) for _ in range(num_layers)])
-        self.edge_scorer = nn.Sequential(nn.Linear(hidden_dim * 2 + in_edge_dim + 1, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, 1), nn.Tanh())
-
-    def forward(self, x6, edge_index, edge_attr, is_par, mask_diff, batch_map=None, num_graphs=None):
-        h = self.node_embed(x6)
-        src, dst = edge_index[0].long(), edge_index[1].long()
-        for layer in self.layers:
-            h = layer(h, edge_index, edge_attr, is_par)
-        edge_feat = torch.cat([h[src], h[dst], edge_attr, is_par], dim=-1)
-        edge_bias = self.edge_scorer(edge_feat)
-        cycle_edges = (mask_diff.abs() > 0).float()
-        cycle_lens = torch.bincount(batch_map[src], weights=cycle_edges.squeeze(-1), minlength=num_graphs).unsqueeze(-1).clamp(min=1)
-        diff_energy_sum = torch.zeros((num_graphs, 1), device=h.device)
-        diff_energy_sum.index_add_(0, batch_map[src], edge_bias * mask_diff)
-        return diff_energy_sum / torch.sqrt(cycle_lens)
-
 def collate_cycle_batch(samples, device):
     x6_list, e_idx_list, e_attr_list, e_par_list, mask_diff_list, batch_map = [], [], [], [], [], []
     node_offset = 0
@@ -82,7 +47,7 @@ def run_benchmark_point(d, p_val, eta, shots, model, device, k_thresh=3.5, tau_t
     R_L, _ = find_exact_logical_reference_chain(adj, num_dets)
     
     max_idx = max(max(u, v) for u, v in raw_edge_dict.keys())
-    num_nodes = max_idx + 1
+    num_nodes = max(max_idx + 1, bnd_z + 1, bnd_x + 1)
     base_x6 = torch.zeros((num_nodes, 6), dtype=torch.float32)
     for i, (z, x, y) in coords.items():
         base_x6[i, 0], base_x6[i, 1], base_x6[i, 2] = z / (d + 1), x / (d + 1), y / (d + 1)
@@ -114,6 +79,7 @@ def run_benchmark_point(d, p_val, eta, shots, model, device, k_thresh=3.5, tau_t
     
     batch_samples = []
     shot_mappings = []
+    VIRTUAL_BOUNDARY = -1
     
     for idx in active_indices:
         s = syn[idx].astype(np.uint8)
@@ -134,20 +100,50 @@ def run_benchmark_point(d, p_val, eta, shots, model, device, k_thresh=3.5, tau_t
         if abs(delta_w) > (k_thresh * d):
             continue
         
-        x6 = base_x6.clone()
+        chain_nodes = set()
+        for u, v in C_0.union(C_1):
+            if u != VIRTUAL_BOUNDARY: chain_nodes.add(u)
+            if v != VIRTUAL_BOUNDARY: chain_nodes.add(v)
+            
         valid_nodes = np.where(s)[0]
         valid_nodes = valid_nodes[valid_nodes < num_nodes]
-        x6[valid_nodes, 5] = 1.0
         
-        mask_diff = torch.zeros((len(canon_edges), 1), dtype=torch.float32)
-        for i, canon in enumerate(canon_edges):
+        sparse_nodes = set(valid_nodes).union(chain_nodes)
+        sparse_nodes.add(bnd_z)
+        sparse_nodes.add(bnd_x)
+        sparse_nodes_list = sorted(list(sparse_nodes))
+        node_to_idx = {n: i for i, n in enumerate(sparse_nodes_list)}
+        
+        x6_sparse = base_x6[sparse_nodes_list].clone()
+        for n in valid_nodes:
+            if n in node_to_idx:
+                x6_sparse[node_to_idx[n], 5] = 1.0
+
+        src, dst, attr, par, canon_edges_sparse = [], [], [], [], []
+        for (u, v), data in raw_edge_dict.items():
+            if u in sparse_nodes and v in sparse_nodes:
+                idx_u, idx_v = node_to_idx[u], node_to_idx[v]
+                src.extend([idx_u, idx_v]); dst.extend([idx_v, idx_u])
+                w_norm = min(float(data.get('weight', 0.0)), 50.0) / 10.0 
+                e_feat = [w_norm, data.get('prob', 0.0), data.get('error_type', 0.0) / 2.0, 1.0]
+                attr.extend([e_feat, e_feat])
+                p_flag = 1.0 if data.get('is_parity', False) else 0.0
+                par.extend([p_flag, p_flag])
+                canon_edges_sparse.extend([standardize_edge(u, v, bnd_z, bnd_x), standardize_edge(v, u, bnd_z, bnd_x)])
+                
+        e_idx_sparse = torch.tensor([src, dst], dtype=torch.long)
+        e_attr_sparse = torch.tensor(attr, dtype=torch.float32)
+        e_par_sparse = torch.tensor(par, dtype=torch.float32)
+        
+        mask_diff = torch.zeros((len(canon_edges_sparse), 1), dtype=torch.float32)
+        for i, canon in enumerate(canon_edges_sparse):
             in_0, in_1 = canon in C_0, canon in C_1
             if in_1 and not in_0: mask_diff[i, 0] = 1.0
             elif in_0 and not in_1: mask_diff[i, 0] = -1.0
             
         batch_samples.append({
-            "x6": x6, "e_idx": base_e_idx, "e_attr": base_e_attr, 
-            "e_par": (base_e_par.view(-1) > 0).float(), "mask_diff": mask_diff
+            "x6": x6_sparse, "e_idx": e_idx_sparse, "e_attr": e_attr_sparse, 
+            "e_par": (e_par_sparse.view(-1) > 0).float(), "mask_diff": mask_diff
         })
         shot_mappings.append({"idx": idx, "obs_A": obs_A})
 
@@ -158,12 +154,12 @@ def run_benchmark_point(d, p_val, eta, shots, model, device, k_thresh=3.5, tau_t
             sub_maps = shot_mappings[i:i+64]
             bx6, be_idx, be_attr, be_par, bmask, bmap, n_g = collate_cycle_batch(sub_batch, device)
             with torch.no_grad():
-                phi_out = model(bx6, be_idx, be_attr, be_par, bmask, batch_map=bmap, num_graphs=n_g)
-                phis = phi_out.cpu().numpy().flatten()
+                edge_logits, pred_delta_w, logical_logits = model(bx6, be_idx, be_attr, be_par, bmask, batch_map=bmap, num_graphs=n_g)
+                logits = logical_logits.cpu().numpy().flatten()
             
-            for phi, sm in zip(phis, sub_maps):
-                if sm["obs_A"] == 0 and phi < -tau_thresh: topo_preds[sm["idx"]] = 1
-                elif sm["obs_A"] == 1 and phi > tau_thresh: topo_preds[sm["idx"]] = 0
+            for logit, sm in zip(logits, sub_maps):
+                if sm["obs_A"] == 0 and logit > tau_thresh: topo_preds[sm["idx"]] = 1
+                elif sm["obs_A"] == 1 and logit < -tau_thresh: topo_preds[sm["idx"]] = 0
 
     mwpm_errors = int(np.sum(preds_mwpm != flips))
     topo_errors = int(np.sum(topo_preds != flips))
@@ -174,7 +170,7 @@ def run_gate4_benchmark():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[*] Initializing Gate 4 Sinter Benchmark on {device.type.upper()}")
     
-    model = TopoOracle(in_node_dim=6, in_edge_dim=4, hidden_dim=64, num_layers=6).to(device)
+    model = MultiscaleTopoOracle(in_node_dim=6, in_edge_dim=4, hidden_dim=64, num_layers=6, bins=3).to(device)
     model_path = "models/topo_gnn_gate4.pt"
     
     if not os.path.exists(model_path):
@@ -235,7 +231,7 @@ def run_gate4_benchmark():
     ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     
     plt.tight_layout()
-    plot_path = "gate4_threshold_plot.png"
+    plot_path = "images/gate4_threshold_plot.png"
     plt.savefig(plot_path, dpi=300)
     print(f"[+] Gate 4 Official Plot saved to: {plot_path}")
 

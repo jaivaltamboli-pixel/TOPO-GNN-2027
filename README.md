@@ -20,15 +20,15 @@ TOPO-GNN-2027/
 ├── models/
 │   └── topo_gnn_gate4.pt          # Serialized production weights for TopoOracle
 ├── src/
-│   ├── audit_phase_a_d_opportunity.py # Parity expansion, reference chains, and safety audits
-│   ├── run_phase_h1_save_model.py     # Training and weight serialization pipeline
-│   ├── run_phase_h2_sinter_benchmark.py # Sinter-compatible evaluation and data collection
-│   └── run_phase_h7_final_plot.py     # Official log-log threshold curve rendering script
+│   ├── topo_oracle_model.py           # Parity expansion, reference chains, and safety audits
+│   ├── train_decoder.py               # Training and weight serialization pipeline
+│   ├── benchmark_sinter.py            # Sinter-compatible evaluation and data collection
+│   └── plot_thresholds.py             # Official log-log threshold curve rendering script
 ├── utils/
 │   ├── graph_builder.py               # DEM graph extraction utilities
 │   └── noise_circuits.py              # Biased surface code circuit generation (Stim)
 ├── gate4_benchmark_results.csv        # Multi-baseline Sinter performance data
-└── gate4_threshold_plot.png           # Official log-log threshold comparison chart
+└── images/gate4_threshold_plot.png           # Official log-log threshold comparison chart
 
 ```
 
@@ -58,7 +58,7 @@ pip install stim pymatching torch sinter matplotlib networkx numpy
 Execute the training loop on combined distance caches ($d=5, 7, 9$) to serialize the core neural engine:
 
 ```bash
-python src/run_phase_h1_save_model.py
+python src/train_decoder.py
 
 ```
 
@@ -67,8 +67,8 @@ python src/run_phase_h1_save_model.py
 Execute the evaluation sweep across noise rates and render the final Sinter comparative analysis:
 
 ```bash
-python src/run_phase_h2_sinter_benchmark.py
-python src/run_phase_h7_final_plot.py
+python src/benchmark_sinter.py
+python src/plot_thresholds.py
 
 ```
 

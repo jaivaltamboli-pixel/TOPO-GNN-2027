@@ -26,7 +26,7 @@ def render_plot():
     ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     
     plt.tight_layout()
-    plot_path = "gate4_threshold_plot.png"
+    plot_path = "images/gate4_threshold_plot.png"
     plt.savefig(plot_path, dpi=300)
     print(f"[+] Gate 4 Official Plot successfully saved to: {plot_path}")
 
