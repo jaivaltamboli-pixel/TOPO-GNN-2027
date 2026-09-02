@@ -1,4 +1,4 @@
-# TOPO-GNN-2027: Topological Graph Neural Network Decoder for Quantum Error Correction
+# TOPO-GNN-2026: Topological Graph Neural Network Decoder for Quantum Error Correction
 
 A production-grade, hybrid classical-AI quantum error correction (QEC) decoder built from scratch to evaluate and enhance surface code performance under highly biased physical noise ($\eta = 100$). The framework integrates **Stim** for stabilizer circuit generation, **PyMatching** for classical Minimum Weight Perfect Matching (MWPM), a custom **6-layer Relational Message-Passing GNN (`TopoOracle`)** in PyTorch, and the **Sinter** simulation framework for rigorous threshold benchmarking.
 
